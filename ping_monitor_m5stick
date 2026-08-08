@@ -1,0 +1,447 @@
+#include <M5Unified.h>
+#include <WiFi.h>
+#include <ESPping.h>
+#include <LittleFS.h>
+#include <WebServer.h>
+#include <time.h>
+
+// Hardware pin mapping for external analog buzzer test (Hat/Grove connector)
+#define EXTERNAL_BUZZER_PIN 1
+
+enum AppState { MENU, EDIT_IP, EDIT_PING_COUNT, RUNNING_PING, SUMMARY, EDIT_WIFI };
+AppState currentState = MENU;
+
+// CHANGE YOUR CREDENTIALS HERE FOR AUTO-CONNECT
+String targetIp = "8.8.8.8";
+int maxPings = 0; 
+String wifiSsid = "WIFI_SSID";
+String wifiPass = "WIFI_PASS";
+
+int currentPingCount = 0;
+int successfulPings = 0;
+int failedPings = 0;
+bool soundEnabled = true;
+String logReport = "";
+
+String* activeStringPtr = nullptr;
+char currentChar = '0';
+int menuIndex = 0;
+
+const int BEEP_SUCCESS_FREQ = 2200;
+const int BEEP_SUCCESS_DURATION = 80;
+const int BEEP_FAILURE_FREQ = 500;
+const int BEEP_FAILURE_DURATION = 1000;
+
+WebServer server(80);
+
+unsigned long btnBLastDebounceTime = 0;
+bool btnBPrevState = false;
+int btnBClickCounter = 0;
+unsigned long btnBLastClickTime = 0;
+bool btnBLongPressTriggered = false;
+
+void drawMenu();
+void handleMenuInput();
+void handleTextInput();
+void handlePingCountEditor();
+void executePingIteration();
+void handleSummaryInput();
+void drawTextEditor(String title, String currentText);
+void drawPingCountEditor();
+void drawSummaryScreen();
+
+String getFormattedTime() {
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+        return "time"; 
+    }
+    char timeStringBuff[20];
+    strftime(timeStringBuff, sizeof(timeStringBuff), "%Y/%m/%d %H:%M:%S", &timeinfo);
+    return String(timeStringBuff);
+}
+
+void triggerBeep(int frequency, int duration) {
+    if (!soundEnabled) return;
+    // Method 1: Hybrid hardware fallback using physical analog pin (Arduino tone style)
+    pinMode(EXTERNAL_BUZZER_PIN, OUTPUT);
+    tone(EXTERNAL_BUZZER_PIN, frequency, duration);
+    M5.Speaker.tone(frequency, duration); 
+    unsigned long start = millis();
+    while (millis() - start < duration) {
+        M5.update();
+        delay(1);
+    }
+    // Explicit clean stop parameters for analog pin line
+    noTone(EXTERNAL_BUZZER_PIN);
+    digitalWrite(EXTERNAL_BUZZER_PIN, LOW);
+}
+
+void handleRoot() {
+    String html = "<html><head><title>Ping Monitor Remote Terminal</title>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<style>body{font-family:Arial;padding:20px;background:#f0f2f5;}input{width:100%;padding:10px;margin:8px 0;box-sizing:border-box;}button{background:#007bff;color:white;padding:12px;border:none;width:100%;cursor:pointer;font-size:16px;margin-top:10px;}</style></head><body>";
+    html += "<h2>Ping Monitor</h2>";
+    
+    html += "<form action='/save_config' method='POST'>";
+    html += "<h3>Network Settings</h3>";
+    html += "WiFi SSID:<br><input type='text' name='ssid' value='" + wifiSsid + "'><br>";
+    html += "WiFi Password:<br><input type='password' name='pass' value='" + wifiPass + "'><br>";
+    html += "<button type='submit'>Save Profile & Restart</button>";
+    html += "</form>";
+    html += "<form action='/set_ip' method='POST'>";
+    html += "<h3>Target Parameters</h3>";
+    html += "Target Destination IP:<br><input type='text' name='target' value='" + targetIp + "'><br>";
+    html += "<button type='submit'>Set IP</button>";
+    html += "</form><hr>";
+
+    html += "<h3>Telemetry Reports</h3>";
+    if (LittleFS.exists("/ping_report.csv")) {
+        html += "<p><a href='/download'><button style='background:#28a745;'>Download Latest Report (.CSV)</button></a></p>";
+    } else {
+        html += "<p style='color:grey;'>No report available on internal memory partition.</p>";
+    }
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+}
+
+void handleSaveConfig() {
+    if (server.hasArg("ssid")) wifiSsid = server.arg("ssid");
+    if (server.hasArg("pass")) wifiPass = server.arg("pass");
+    
+    server.send(200, "text/html", "<html><body><h3>Configuration Saved! Rebooting device...</h3></body></html>");
+    delay(2000);
+    ESP.restart();
+}
+
+void handleSaveIP() {
+    if (server.hasArg("target")) targetIp = server.arg("target");
+    handleRoot();
+}
+void handleFileDownload() {
+    if (!LittleFS.exists("/ping_report.csv")) {
+        server.send(404, "text/plain", "File Not Found.");
+        return;
+    }
+    File file = LittleFS.open("/ping_report.csv", "r");
+    if (file) {
+        String safeIp = targetIp;
+        safeIp.replace(".", "_");
+        String filename = "ping_" + safeIp + "_" + getFormattedTime() + ".csv";
+        
+        server.sendHeader("Content-Disposition", "attachment; filename=" + filename);
+        server.streamFile(file, "text/csv");
+        file.close();
+    } else {
+        server.send(500, "text/plain", "Internal read failure.");
+    }
+}
+
+void setup() {
+    auto cfg = M5.config();
+    cfg.internal_spk = true;
+    M5.begin(cfg);
+    
+    M5.In_I2C.release(); 
+    M5.Display.begin();
+    M5.Display.setRotation(1);       
+    M5.Display.setBrightness(150);   
+    M5.Display.fillScreen(BLACK);
+    M5.Display.setTextSize(1); 
+    
+    M5.Speaker.begin();
+    M5.Speaker.setVolume(255);
+    
+    // Open mixer channel to guarantee audio delivery
+    M5.Speaker.setChannelVolume(1, 255);   
+
+    if (!LittleFS.begin(true)) {
+        M5.Display.println("Storage Error!");
+        delay(2000);
+    }
+    
+    server.on("/", handleRoot);
+    server.on("/save_config", handleSaveConfig);
+    server.on("/set_ip", handleSaveIP);
+    server.on("/download", handleFileDownload);
+
+    M5.Display.println("Booting Server...");
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    
+    int connTimeout = 0;
+    while (WiFi.status() != WL_CONNECTED && connTimeout < 12) {
+        delay(500);
+        M5.Display.print(".");
+        connTimeout++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+        server.begin();
+        M5.Display.printf("\nWiFi Online!\nIP Web Address: %s\n", WiFi.localIP().toString().c_str());
+        triggerBeep(2000, 250); // Initial boot confirmation chime
+    } else {
+        M5.Display.println("\nWiFi Offline. Standalone Mode active.");
+    }
+    delay(2500);
+    drawMenu();
+}
+
+void loop() {
+    M5.update();
+    server.handleClient(); 
+    
+    switch (currentState) {
+        case MENU:             handleMenuInput();       break;
+        case EDIT_IP:
+        case EDIT_WIFI:        handleTextInput();       break;
+        case EDIT_PING_COUNT:  handlePingCountEditor(); break;
+        case RUNNING_PING:     executePingIteration();  break;
+        case SUMMARY:          handleSummaryInput();    break;
+    }
+    delay(30);
+}
+
+void drawMenu() {
+    M5.Display.fillScreen(BLACK);
+    M5.Display.setTextColor(GREEN);
+    M5.Display.setCursor(10, 5);
+    M5.Display.println("=== Ping Monitor ===");
+    M5.Display.setTextColor(WHITE);
+    M5.Display.printf("Web UI Server status: %s\n\n", WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "OFFLINE");
+    
+    if (menuIndex == 0) M5.Display.setTextColor(YELLOW);
+    M5.Display.printf("%s 1. Enter IP (%s)\n", (menuIndex == 0 ? ">" : " "), targetIp.c_str());
+    M5.Display.setTextColor(WHITE);
+    
+    if (menuIndex == 1) M5.Display.setTextColor(YELLOW);
+    M5.Display.printf("%s 2. Connect WiFi (%s)\n", (menuIndex == 1 ? ">" : " "), WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+}
+
+void drawTextEditor(String title, String currentText) {
+    M5.Display.fillScreen(BLACK);
+    M5.Display.setCursor(10, 10);
+    M5.Display.setTextColor(GREEN);
+    M5.Display.println(title);
+    M5.Display.setTextColor(WHITE);
+    M5.Display.print("Value: ");
+    M5.Display.println(currentText);
+    
+    M5.Display.setTextColor(CYAN);
+    M5.Display.printf("\nActive Buffer Char: [%c]\n", currentChar);
+    M5.Display.setTextColor(WHITE);
+    M5.Display.println("\n[SideBtn] Click:+1 | 2x:-1 | Long:Confirm Char");
+    M5.Display.println("[FrontBtn] Click: Save Field | Long: Backspace");
+}
+
+void drawPingCountEditor() {
+    M5.Display.fillScreen(BLACK);
+    M5.Display.setCursor(10, 10);
+    M5.Display.setTextColor(GREEN);
+    M5.Display.println("Ping Total Target");
+    M5.Display.setTextColor(WHITE);
+    M5.Display.printf("\nCount: %d %s\n", maxPings, (maxPings == 0 ? "(Infinite)" : ""));
+    M5.Display.println("\n[SideBtn] Click: +5 | Long: -5");
+    M5.Display.println("[FrontBtn] Click: Run | Long: Reset to 0");
+}
+
+void drawSummaryScreen() {
+    M5.Display.fillScreen(BLACK);
+    M5.Display.setCursor(10, 5);
+    M5.Display.setTextColor(GREEN);
+    M5.Display.println("--- Test Summary ---");
+    M5.Display.setTextColor(WHITE);
+    M5.Display.printf("Total: %d | Success: %d | Failed: %d\n", currentPingCount, successfulPings, failedPings);
+    
+    M5.Display.setTextColor(YELLOW);
+    M5.Display.println("\nOptions (Front Button):");
+    M5.Display.println("Click: Resume Test");
+    M5.Display.println("Long Press: Commit File to Storage");
+    M5.Display.println("\nOptions (Side Button):");
+    M5.Display.println("Click: Go to Main Menu");
+}
+
+void handleMenuInput() {
+    if (M5.BtnB.wasClicked()) {
+        menuIndex = (menuIndex == 0) ? 1 : 0;
+        drawMenu();
+    }
+    if (M5.BtnA.wasClicked()) {
+        if (menuIndex == 0) {
+            currentState = EDIT_IP;
+            activeStringPtr = &targetIp;
+            currentChar = '0';
+            drawTextEditor("Target IP Configuration", *activeStringPtr);
+        } else if (menuIndex == 1) {
+            currentState = EDIT_WIFI;
+            activeStringPtr = &wifiSsid; 
+            currentChar = 'A';
+            drawTextEditor("Enter WiFi SSID", *activeStringPtr);
+        }
+    }
+}
+
+void handleTextInput() {
+    unsigned long now = millis();
+    bool btnBPressed = M5.BtnB.isPressed();
+
+    // 1. Long Press Detection logic loop (Side Button - B to confirm current char)
+    if (btnBPressed) {
+        if ((now - btnBLastDebounceTime > 600) && !btnBLongPressTriggered && btnBPrevState) {
+            btnBLongPressTriggered = true;
+            btnBClickCounter = 0;
+            // Action -> Append character to the active string
+            *activeStringPtr += currentChar;
+            
+            // Reset character preview selector back to standard baseline '0'
+            currentChar = '0'; 
+            drawTextEditor(currentState == EDIT_IP ? "Target IP" : "WiFi Setup", *activeStringPtr);
+        }
+    }
+
+    // 2. Capture state transitions (Release bounds)
+    if (!btnBPressed && btnBPrevState) {
+        btnBLastDebounceTime = now;
+        if (!btnBLongPressTriggered) {
+            btnBClickCounter++;
+            btnBLastClickTime = now;
+        }
+        btnBLongPressTriggered = false;
+    }
+    
+    if (btnBPressed && !btnBPrevState) {
+        btnBLastDebounceTime = now;
+    }
+    btnBPrevState = btnBPressed;
+
+    // 3. Process Clicks after specific timeout frame (280ms)
+    if (btnBClickCounter > 0 && (now - btnBLastClickTime > 280) && !btnBPressed) {
+        if (btnBClickCounter == 2) { // Double Click -> Previous Char (Allows any printable ASCII char)
+            currentChar--;
+            if (currentChar < 32) currentChar = 126; // Cycles backward past printable space bounds down to '~'
+        } 
+        else if (btnBClickCounter == 1) { // Single Click -> Next Char (Allows any printable ASCII char)
+            currentChar++;
+            if (currentChar > 126) currentChar = 32; // Cycles forward past '~' back up to basic space bounds
+        }
+        btnBClickCounter = 0;
+        drawTextEditor(currentState == EDIT_IP ? "Target IP" : "WiFi Setup", *activeStringPtr + currentChar);
+    }
+
+    // 4. Backspace Execution mapping via Front Button Hold (Button A)
+    if (M5.BtnA.wasHold()) {
+        if (activeStringPtr->length() > 0) {
+            activeStringPtr->remove(activeStringPtr->length() - 1);
+        }
+        currentChar = '0'; 
+        drawTextEditor(currentState == EDIT_IP ? "Target IP" : "WiFi Setup", *activeStringPtr);
+        return;
+    }
+
+    // 5. Single Click Front Button (Button A) -> Confirms and saves the complete profile entry
+    if (M5.BtnA.wasClicked()) {
+        if (currentState == EDIT_IP) { 
+            currentState = EDIT_PING_COUNT; 
+            drawPingCountEditor(); 
+        }
+        else if (currentState == EDIT_WIFI) {
+            if (activeStringPtr == &wifiSsid) { 
+                activeStringPtr = &wifiPass; 
+                *activeStringPtr = ""; 
+                currentChar = '0'; 
+                drawTextEditor("Enter WiFi Password", *activeStringPtr); 
+            }
+            else { 
+                M5.Display.fillScreen(BLACK); 
+                M5.Display.println("Saving WiFi..."); 
+                WiFi.begin(wifiSsid.c_str(), wifiPass.c_str()); 
+                delay(1500); 
+                currentState = MENU; 
+                drawMenu(); 
+            }
+        }
+    }
+}
+
+void handlePingCountEditor() {
+    if (M5.BtnB.wasClicked()) {
+        maxPings += 5;
+    if (maxPings > 100) maxPings = 0;
+        drawPingCountEditor();
+    }
+    if (M5.BtnB.wasHold()) {
+        maxPings -= 5;
+    if (maxPings < 0) maxPings = 100;
+        drawPingCountEditor();
+    }
+    if (M5.BtnA.wasHold()) {
+        maxPings = 0;
+        drawPingCountEditor();
+    }
+    else if (M5.BtnA.wasClicked()) {
+        currentState = RUNNING_PING;
+        currentPingCount = 0; successfulPings = 0; failedPings = 0;
+        logReport = "Sequence,Timestamp,Target_IP,Status,Response_Time_ms\n";
+        M5.Display.fillScreen(BLACK);
+        M5.Display.setCursor(0, 0);
+        M5.Display.println("Ping to target: "+String(targetIp));
+    }
+}
+void executePingIteration() {
+    bool abortTest = false;
+    if (M5.BtnB.wasHold()) soundEnabled = !soundEnabled;
+    if (M5.BtnA.wasHold() || M5.BtnA.wasClicked()) abortTest = true;
+    if (abortTest || (maxPings > 0 && currentPingCount >= maxPings)) {
+        currentState = SUMMARY;
+        drawSummaryScreen();
+        return;
+    }
+    currentPingCount++;
+    IPAddress target;
+    bool parseSuccess = target.fromString(targetIp);
+    bool pingResult = parseSuccess ? Ping.ping(target, 1) : Ping.ping(targetIp.c_str(), 1);
+    String outputLine = "";
+    String timeStampStr = getFormattedTime();
+    if (pingResult) {
+        successfulPings++;
+        int msTime = Ping.averageTime();
+        outputLine = String(currentPingCount) + ": Reply time=" + String(msTime) + "ms\n";
+        logReport += String(currentPingCount) + "," + timeStampStr + "," + targetIp + ",SUCCESS," + String(msTime) + "\n";
+        M5.Display.setTextColor(GREEN);
+        triggerBeep(BEEP_SUCCESS_FREQ, BEEP_SUCCESS_DURATION);
+    } else {
+        failedPings++;
+        outputLine = String(currentPingCount) + ": Request timed out.\n";
+        logReport += String(currentPingCount) + "," + timeStampStr + "," + targetIp + ",TIMEOUT,0\n";
+        M5.Display.setTextColor(RED);
+        triggerBeep(BEEP_FAILURE_FREQ, BEEP_FAILURE_DURATION);
+    }
+    if (M5.Display.getCursorY() > M5.Display.height() - 15) {
+        M5.Display.fillScreen(BLACK); 
+        M5.Display.setCursor(0, 0);
+    }
+    M5.Display.print(outputLine);
+    delay(1000);
+}
+void handleSummaryInput() {
+    if (M5.BtnA.wasHold()) {
+        M5.Display.fillScreen(BLACK); 
+        M5.Display.setCursor(10, 30);
+        File logFile = LittleFS.open("/ping_report.csv", "w");
+        if (logFile) {
+            logFile.print(logReport); 
+            logFile.close();
+            M5.Display.println("Saved CSV to Storage!");
+        } else {
+            M5.Display.println("Storage Error!");
+        }
+        delay(2000); drawSummaryScreen();
+    } else if (M5.BtnA.wasClicked()) {
+        currentState = RUNNING_PING;
+        M5.Display.fillScreen(BLACK); 
+        M5.Display.setCursor(0, 0);
+        M5.Display.println("Resuming...");
+    } else if (M5.BtnB.wasClicked()) {
+        currentState = MENU;
+        drawMenu();
+    }
+}
